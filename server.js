@@ -312,6 +312,78 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
+const path = require('path');
+const { URL } = require('url');
+// Helper function to extract filename from URL or headers
+function getFileNameFromUrl(pdfUrl, contentDispositionHeader) {
+    // 1. Try extracting from Content-Disposition header (e.g., 'attachment; filename="Invoice_2026.pdf"')
+    if (contentDispositionHeader) {
+        const match = contentDispositionHeader.match(/filename\*?=(?:'[^']*')?["']?([^"';\n]+)["']?/i);
+        if (match && match[1]) {
+            return decodeURIComponent(match[1]);
+        }
+    }
+
+    // 2. Fallback: Parse the file name from URL path (e.g., https://site.com/docs/Report_Q2.pdf -> Report_Q2.pdf)
+    try {
+        const parsedUrl = new URL(pdfUrl);
+        const basename = path.basename(parsedUrl.pathname);
+        if (basename && basename.toLowerCase().endsWith('.pdf')) {
+            return decodeURIComponent(basename);
+        }
+    } catch (e) {
+        // Ignore URL parsing errors
+    }
+
+    // 3. Ultimate fallback if URL has no clear filename
+    return 'document.pdf';
+}
+
+// --- Send PDF Endpoint ---
+app.post('/send-pdf', async (req, res) => {
+    const { number, pdfUrl, fileName: customFileName, caption } = req.body;
+
+    if (!isConnected) {
+        return res.status(503).json({ status: 'error', message: 'WhatsApp client is not connected.' });
+    }
+
+    if (!number || !pdfUrl) {
+        return res.status(400).json({ status: 'error', message: 'Fields "number" and "pdfUrl" are required.' });
+    }
+
+    try {
+        let formattedNumber = number.replace(/\D/g, '');
+        if (!formattedNumber.endsWith('@s.whatsapp.net')) {
+            formattedNumber = `${formattedNumber}@s.whatsapp.net`;
+        }
+
+        // Fetch PDF file buffer and headers
+        const response = await axios.get(pdfUrl, { responseType: 'arraybuffer' });
+        const pdfBuffer = Buffer.from(response.data, 'binary');
+
+        // Resolve filename: Explicit request parameter -> Server Header / URL path -> Default fallback
+        const resolvedFileName = customFileName || getFileNameFromUrl(pdfUrl, response.headers['content-disposition']);
+
+        const sent = await sock.sendMessage(formattedNumber, {
+            document: pdfBuffer,
+            mimetype: 'application/pdf',
+            fileName: resolvedFileName, // Preserves original filename automatically
+            caption: caption || ''
+        });
+
+        return res.json({ 
+            status: 'success', 
+            message: `PDF (${resolvedFileName}) sent successfully!`, 
+            messageId: sent.key.id 
+        });
+
+    } catch (error) {
+        console.error('Error sending PDF:', error);
+        return res.status(500).json({ status: 'error', error: error.message });
+    }
+});
+
+
 app.listen(PORT, () => {
     console.log(`🌐 Server active on http://localhost:${PORT}`);
     startWhatsApp();
