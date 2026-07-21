@@ -312,7 +312,6 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
-const path = require('path');
 const { URL } = require('url');
 // Helper function to extract filename from URL or headers
 function getFileNameFromUrl(pdfUrl, contentDispositionHeader) {
