@@ -1,9 +1,12 @@
 const { 
     default: makeWASocket, 
     useMultiFileAuthState, 
-    DisconnectReason 
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    Browsers
 } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode-terminal');
+const qrcodeTerminal = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const express = require('express');
 const cors = require('cors');
 const pino = require('pino');
@@ -16,50 +19,64 @@ app.use(express.json());
 
 let sock;
 let isConnected = false;
+let qrCodeUrl = null;
 
 async function startWhatsApp() {
-    // 1. Initialize local file auth state (stores JSON keys inside ./.baileys_auth)
+    // 1. Fetch latest WhatsApp Web version to prevent protocol rejection
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`🔄 Using WhatsApp Web v${version.join('.')} (isLatest: ${isLatest})`);
+
+    // 2. Load auth state from .baileys_auth folder
     const { state, saveCreds } = await useMultiFileAuthState('.baileys_auth');
 
-    // 2. Create the Baileys WebSocket connection
+    // 3. Create socket connection simulating a desktop Chrome browser
     sock = makeWASocket({
+        version,
         auth: state,
         printQRInTerminal: false,
-        logger: pino({ level: 'silent' })
+        logger: pino({ level: 'silent' }),
+        browser: Browsers.macOS('Desktop'), // Simulates desktop browser connection
+        syncFullHistory: false
     });
 
-    // Automatically save updated session keys
     sock.ev.on('creds.update', saveCreds);
 
-    // 3. Handle connection status updates
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
+        // Render QR Code as Base64 Image
         if (qr) {
-            console.log('\n========================================');
-            console.log('SCAN THIS QR CODE IN YOUR PHONE (LINKED DEVICES):');
-            console.log('========================================\n');
-            qrcode.generate(qr, { small: true });
+            try {
+                qrCodeUrl = await QRCode.toDataURL(qr);
+                qrcodeTerminal.generate(qr, { small: true });
+            } catch (err) {
+                console.error('Failed to render QR Code:', err);
+            }
         }
 
         if (connection === 'close') {
             isConnected = false;
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            
+            // Extract HTTP status code from Boom error payload
+            const statusCode = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-            console.log(`Connection closed (Reason: ${statusCode}). Reconnecting: ${shouldReconnect}`);
+            console.log(`⚠️ Connection closed. Status Code: ${statusCode}. Reconnecting: ${shouldReconnect}`);
+
+            // Automatically reconnect for temporary drops (including 515 restartRequired)
             if (shouldReconnect) {
                 setTimeout(startWhatsApp, 3000);
             } else {
-                console.log('Session logged out. Delete the .baileys_auth folder to generate a new QR.');
+                console.log('❌ Logged out from WhatsApp. Clear .baileys_auth folder and restart.');
+                qrCodeUrl = null;
             }
         } else if (connection === 'open') {
             isConnected = true;
-            console.log('✅ WhatsApp Baileys Socket is active and ready!');
+            qrCodeUrl = null;
+            console.log('✅ WhatsApp connection established successfully!');
         }
     });
 
-    // 4. Message Handler Example
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type === 'notify') {
             for (const msg of messages) {
@@ -74,16 +91,53 @@ async function startWhatsApp() {
     });
 }
 
-// Helper to format numbers (e.g., 15551234567@s.whatsapp.net)
-function formatJid(number) {
-    let cleaned = number.replace(/\D/g, '');
-    if (!cleaned.endsWith('@s.whatsapp.net')) {
-        cleaned = `${cleaned}@s.whatsapp.net`;
+// --- Serve QR Page at '/' ---
+app.get('/', (req, res) => {
+    if (isConnected) {
+        return res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head><title>WhatsApp Status</title></head>
+            <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+                <h2 style="color: #25D366;">✅ WhatsApp Connected!</h2>
+                <p>Your session is online and ready to send messages.</p>
+            </body>
+            </html>
+        `);
     }
-    return cleaned;
-}
 
-// API Routes
+    if (qrCodeUrl) {
+        return res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Scan WhatsApp QR Code</title>
+                <meta http-equiv="refresh" content="10">
+            </head>
+            <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+                <h2>Scan with WhatsApp</h2>
+                <p>Open WhatsApp → Linked Devices → Link a Device</p>
+                <img src="${qrCodeUrl}" style="width:250px; height:250px;" />
+            </body>
+            </html>
+        `);
+    }
+
+    return res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Loading...</title>
+            <meta http-equiv="refresh" content="3">
+        </head>
+        <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+            <h2>⏳ Connecting to WhatsApp...</h2>
+            <p>Please wait a moment while the socket initializes.</p>
+        </body>
+        </html>
+    `);
+});
+
 app.get('/status', (req, res) => {
     res.json({ status: isConnected ? 'connected' : 'disconnected' });
 });
@@ -92,7 +146,7 @@ app.post('/send-message', async (req, res) => {
     const { number, message } = req.body;
 
     if (!isConnected) {
-        return res.status(503).json({ status: 'error', message: 'WhatsApp client is not ready.' });
+        return res.status(503).json({ status: 'error', message: 'WhatsApp client is not connected.' });
     }
 
     if (!number || !message) {
@@ -100,11 +154,13 @@ app.post('/send-message', async (req, res) => {
     }
 
     try {
-        const jid = formatJid(number);
-        const sent = await sock.sendMessage(jid, { text: message });
+        let cleaned = number.replace(/\D/g, '');
+        if (!cleaned.endsWith('@s.whatsapp.net')) {
+            cleaned = `${cleaned}@s.whatsapp.net`;
+        }
+        const sent = await sock.sendMessage(cleaned, { text: message });
         return res.json({ status: 'success', messageId: sent.key.id });
     } catch (error) {
-        console.error('Failed to send message:', error);
         return res.status(500).json({ status: 'error', error: error.message });
     }
 });
