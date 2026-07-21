@@ -38,69 +38,79 @@ function clearAuthFolder() {
     }
 }
 
+// Add a status flag to track if the socket handshake is warm
+let isSocketWarm = false;
+
 async function startWhatsApp() {
-    const { version } = await fetchLatestBaileysVersion();
-    console.log(`🔄 Using WA Web Version: ${version.join('.')}`);
-
-    const { state, saveCreds } = await useMultiFileAuthState('.baileys_auth');
-
-    sock = makeWASocket({
-        version,
-        auth: state,
-        printQRInTerminal: false,
-        logger: pino({ level: 'silent' }),
-        browser: Browsers.macOS('Chrome'),
-        syncFullHistory: false
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr) {
-            try {
-                // FIX: Add explicit quiet zone margin (padding) & size
-                qrCodeUrl = await QRCode.toDataURL(qr, {
-                    margin: 6,         // Generates clear quiet zone around QR
-                    width: 300,        // Ensures high resolution
-                    color: {
-                        dark: '#000000',
-                        light: '#FFFFFF'
-                    }
-                });
-                qrcodeTerminal.generate(qr, { small: true });
-            } catch (err) {
-                console.error('Failed to generate QR Code:', err);
-            }
+    try {
+        if (mongoose.connection.readyState !== 1) {
+            await mongoose.connect(MONGO_URI);
+            console.log('📦 Connected to MongoDB Atlas');
         }
 
-        if (connection === 'close') {
-            isConnected = false;
-            qrCodeUrl = null;
-            pairingCode = null;
+        const { state, saveCreds } = await useMongoDBAuthState('session_main');
+        const { version } = await fetchLatestBaileysVersion();
 
-            const statusCode = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        sock = makeWASocket({
+            version,
+            auth: state,
+            printQRInTerminal: false,
+            logger: pino({ level: 'silent' }),
+            browser: ['Mac OS', 'Chrome', '120.0.0.0'],
+            connectTimeoutMs: 60000,          // Extend timeout for cloud hosting / Render
+            defaultQueryTimeoutMs: undefined,
+            keepAliveIntervalMs: 25000         // Keep WebSocket ping active
+        });
 
-            console.log(`⚠️ Connection closed (Code ${statusCode}). Reconnecting: ${shouldReconnect}`);
+        sock.ev.on('creds.update', saveCreds);
 
-            if (shouldReconnect) {
-                setTimeout(startWhatsApp, 3000);
-            } else {
-                console.log('❌ Logged out. Resetting auth folder...');
-                clearAuthFolder();
-                setTimeout(startWhatsApp, 3000);
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
+
+            // Only process and serve QR once the connection state is active
+            if (qr) {
+                try {
+                    // Small delay to ensure WebSocket frame buffer is ready for authentication handshake
+                    await new Promise(resolve => setTimeout(resolve, 800));
+
+                    currentQrDataUrl = await QRCode.toDataURL(qr, {
+                        margin: 4,
+                        scale: 10,
+                        color: {
+                            dark: '#000000',
+                            light: '#FFFFFF'
+                        }
+                    });
+                    console.log('🔄 Fresh, active QR code generated');
+                } catch (err) {
+                    console.error('Failed to generate QR code:', err);
+                }
             }
-        } else if (connection === 'open') {
-            isConnected = true;
-            qrCodeUrl = null;
-            pairingCode = null;
-            console.log('✅ Connected successfully to WhatsApp!');
-        }
-    });
+
+            if (connection === 'close') {
+                isConnected = false;
+                currentQrDataUrl = null;
+                currentPairingCode = null;
+                
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+                console.log(`Connection closed (Reason: ${statusCode}). Reconnecting in 3s...`);
+                if (shouldReconnect) {
+                    setTimeout(startWhatsApp, 3000);
+                }
+            } else if (connection === 'open') {
+                isConnected = true;
+                currentQrDataUrl = null;
+                currentPairingCode = null;
+                console.log('✅ WhatsApp connection established and authenticated!');
+            }
+        });
+
+    } catch (err) {
+        console.error('Fatal initialization error:', err);
+    }
 }
-
 // Helpers
 function formatJid(number) {
     let cleaned = number.replace(/\D/g, '');
