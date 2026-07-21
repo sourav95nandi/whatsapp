@@ -12,6 +12,8 @@ const cors = require('cors');
 const pino = require('pino');
 const fs = require('fs');
 
+const axios = require('axios');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -166,6 +168,9 @@ app.post('/send-message', async (req, res) => {
 
 //SEND-PDF
 // Helper function to extract filename from URL or headers
+const path = require('path');
+const { URL } = require('url');
+
 function getFileNameFromUrl(pdfUrl, contentDispositionHeader) {
     // 1. Try extracting from Content-Disposition header (e.g., 'attachment; filename="Invoice_2026.pdf"')
     if (contentDispositionHeader) {
