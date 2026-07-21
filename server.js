@@ -134,6 +134,52 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
+const axios = require('axios'); // Ensure axios is imported at top of file
+
+// --- Send PDF Endpoint ---
+app.post('/send-pdf', async (req, res) => {
+    const { number, pdfUrl, fileName, caption } = req.body;
+
+    if (!isConnected) {
+        return res.status(503).json({ status: 'error', message: 'WhatsApp client is not connected.' });
+    }
+
+    if (!number || !pdfUrl) {
+        return res.status(400).json({ status: 'error', message: 'Fields "number" and "pdfUrl" are required.' });
+    }
+
+    try {
+        // 1. Format recipient phone number
+        let formattedNumber = number.replace(/\D/g, '');
+        if (!formattedNumber.endsWith('@s.whatsapp.net')) {
+            formattedNumber = `${formattedNumber}@s.whatsapp.net`;
+        }
+
+        // 2. Fetch the PDF file as a Buffer
+        const response = await axios.get(pdfUrl, { responseType: 'arraybuffer' });
+        const pdfBuffer = Buffer.from(response.data, 'binary');
+
+        // 3. Send document via Baileys
+        const sent = await sock.sendMessage(formattedNumber, {
+            document: pdfBuffer,
+            mimetype: 'application/pdf',
+            fileName: fileName || 'document.pdf', // File name shown in WhatsApp
+            caption: caption || ''                // Optional text caption under the file
+        });
+
+        return res.json({ 
+            status: 'success', 
+            message: 'PDF sent successfully!', 
+            messageId: sent.key.id 
+        });
+
+    } catch (error) {
+        console.error('Error sending PDF:', error);
+        return res.status(500).json({ status: 'error', error: error.message });
+    }
+});
+
+
 // 4. Web Page at '/'
 app.get('/', (req, res) => {
     res.send(`
