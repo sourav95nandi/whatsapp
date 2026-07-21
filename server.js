@@ -10,32 +10,43 @@ const QRCode = require('qrcode');
 const express = require('express');
 const cors = require('cors');
 const pino = require('pino');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json()); // Essential to parse JSON payloads in POST requests
 
 let sock;
 let isConnected = false;
 let qrCodeUrl = null;
 
-async function startWhatsApp() {
-    // 1. Fetch latest WhatsApp Web version to prevent protocol rejection
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`🔄 Using WhatsApp Web v${version.join('.')} (isLatest: ${isLatest})`);
+// Helper to clear invalid cache
+function clearAuthFolder() {
+    const authPath = './.baileys_auth';
+    if (fs.existsSync(authPath)) {
+        try {
+            fs.rmSync(authPath, { recursive: true, force: true });
+            console.log('🧹 Purged .baileys_auth session files.');
+        } catch (err) {
+            console.error('Error clearing folder:', err);
+        }
+    }
+}
 
-    // 2. Load auth state from .baileys_auth folder
+async function startWhatsApp() {
+    const { version } = await fetchLatestBaileysVersion();
+    console.log(`🔄 Using WA Web Version: ${version.join('.')}`);
+
     const { state, saveCreds } = await useMultiFileAuthState('.baileys_auth');
 
-    // 3. Create socket connection simulating a desktop Chrome browser
     sock = makeWASocket({
         version,
         auth: state,
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.macOS('Desktop'), // Simulates desktop browser connection
+        browser: Browsers.macOS('Chrome'),
         syncFullHistory: false
     });
 
@@ -44,104 +55,64 @@ async function startWhatsApp() {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        // Render QR Code as Base64 Image
         if (qr) {
             try {
                 qrCodeUrl = await QRCode.toDataURL(qr);
                 qrcodeTerminal.generate(qr, { small: true });
             } catch (err) {
-                console.error('Failed to render QR Code:', err);
+                console.error('Failed to generate QR Code:', err);
             }
         }
 
         if (connection === 'close') {
             isConnected = false;
-            
-            // Extract HTTP status code from Boom error payload
+            qrCodeUrl = null;
+
             const statusCode = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-            console.log(`⚠️ Connection closed. Status Code: ${statusCode}. Reconnecting: ${shouldReconnect}`);
+            console.log(`⚠️ Connection closed (Code ${statusCode}). Reconnecting: ${shouldReconnect}`);
 
-            // Automatically reconnect for temporary drops (including 515 restartRequired)
             if (shouldReconnect) {
                 setTimeout(startWhatsApp, 3000);
             } else {
-                console.log('❌ Logged out from WhatsApp. Clear .baileys_auth folder and restart.');
-                qrCodeUrl = null;
+                console.log('❌ Unlinked or logged out. Resetting auth...');
+                clearAuthFolder();
+                setTimeout(startWhatsApp, 3000);
             }
         } else if (connection === 'open') {
             isConnected = true;
             qrCodeUrl = null;
-            console.log('✅ WhatsApp connection established successfully!');
-        }
-    });
-
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type === 'notify') {
-            for (const msg of messages) {
-                if (!msg.key.fromMe && msg.message) {
-                    const body = msg.message.conversation || msg.message.extendedTextMessage?.text;
-                    if (body?.toLowerCase() === '!ping') {
-                        await sock.sendMessage(msg.key.remoteJid, { text: 'pong!' });
-                    }
-                }
-            }
+            console.log('✅ Connected successfully!');
         }
     });
 }
 
-// --- Serve QR Page at '/' ---
-app.get('/', (req, res) => {
-    if (isConnected) {
-        return res.send(`
-            <!DOCTYPE html>
-            <html>
-            <head><title>WhatsApp Status</title></head>
-            <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-                <h2 style="color: #25D366;">✅ WhatsApp Connected!</h2>
-                <p>Your session is online and ready to send messages.</p>
-            </body>
-            </html>
-        `);
+// Format Phone Numbers to JID
+function formatJid(number) {
+    let cleaned = number.replace(/\D/g, '');
+    if (!cleaned.endsWith('@s.whatsapp.net')) {
+        cleaned = `${cleaned}@s.whatsapp.net`;
     }
+    return cleaned;
+}
 
-    if (qrCodeUrl) {
-        return res.send(`
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Scan WhatsApp QR Code</title>
-                <meta http-equiv="refresh" content="10">
-            </head>
-            <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-                <h2>Scan with WhatsApp</h2>
-                <p>Open WhatsApp → Linked Devices → Link a Device</p>
-                <img src="${qrCodeUrl}" style="width:250px; height:250px;" />
-            </body>
-            </html>
-        `);
-    }
+// --- Express Routes ---
 
-    return res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Loading...</title>
-            <meta http-equiv="refresh" content="3">
-        </head>
-        <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-            <h2>⏳ Connecting to WhatsApp...</h2>
-            <p>Please wait a moment while the socket initializes.</p>
-        </body>
-        </html>
-    `);
+// 1. Dynamic QR Code JSON endpoint
+app.get('/qr-data', (req, res) => {
+    res.json({
+        connected: isConnected,
+        qr: qrCodeUrl
+    });
 });
 
+// 2. Status Route
 app.get('/status', (req, res) => {
     res.json({ status: isConnected ? 'connected' : 'disconnected' });
 });
 
+// 3. Send Message API Endpoint (Restored)
 app.post('/send-message', async (req, res) => {
     const { number, message } = req.body;
 
@@ -154,15 +125,61 @@ app.post('/send-message', async (req, res) => {
     }
 
     try {
-        let cleaned = number.replace(/\D/g, '');
-        if (!cleaned.endsWith('@s.whatsapp.net')) {
-            cleaned = `${cleaned}@s.whatsapp.net`;
-        }
-        const sent = await sock.sendMessage(cleaned, { text: message });
+        const jid = formatJid(number);
+        const sent = await sock.sendMessage(jid, { text: message });
         return res.json({ status: 'success', messageId: sent.key.id });
     } catch (error) {
+        console.error('Failed to send message:', error);
         return res.status(500).json({ status: 'error', error: error.message });
     }
+});
+
+// 4. Web Page at '/'
+app.get('/', (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>WhatsApp Web QR Link</title>
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding-top: 50px; background: #f0f2f5; }
+                .card { background: white; padding: 30px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 320px; }
+                img { width: 250px; height: 250px; margin-top: 15px; }
+                .connected { color: #25D366; }
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <div id="content">
+                    <h3>⏳ Initializing...</h3>
+                </div>
+            </div>
+
+            <script>
+                async function checkStatus() {
+                    try {
+                        const res = await fetch('/qr-data');
+                        const data = await res.json();
+                        const content = document.getElementById('content');
+
+                        if (data.connected) {
+                            content.innerHTML = '<h2 class="connected">✅ Connected!</h2><p>WhatsApp session is active.</p>';
+                        } else if (data.qr) {
+                            content.innerHTML = '<h2>Scan with WhatsApp</h2><p>Linked Devices → Link a Device</p><img src="' + data.qr + '" />';
+                        } else {
+                            content.innerHTML = '<h3>⏳ Generating QR Code...</h3>';
+                        }
+                    } catch (e) {
+                        console.error(e);
+                    }
+                }
+
+                setInterval(checkStatus, 2000);
+                checkStatus();
+            </script>
+        </body>
+        </html>
+    `);
 });
 
 app.listen(PORT, () => {
